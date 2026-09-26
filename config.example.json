@@ -1,0 +1,42 @@
+{
+  "video_threshold": 1.0,
+  "video_stall_timeout_seconds": 120,
+  "completion_wait_seconds": 3,
+  "next_click_interval": 4.5,
+  "poll_seconds": 1,
+  "reading_scroll_pause": 0.2,
+  "reading_min_seconds": 2,
+  "empty_grace_seconds": 3,
+  "task_timeout_seconds": 1800,
+  "page_ready_timeout": 15,
+  "next_button_timeout": 20,
+  "submit_timeout_seconds": 25,
+  "verify_submit_success": false,
+  "ai": {
+    "enabled": false,
+    "base_url": "https://4router.net/v1",
+    "model": "claude-haiku-4-5-20251001",
+    "fallback_models": [],
+    "confidence_switch_threshold": 0,
+    "ensemble": false,
+    "ensemble_models": ["claude-haiku-4-5-20251001", "claude-sonnet-5"],
+    "verify_threshold": 0.85,
+    "vision": true,
+    "api_key_env": "AI_API_KEY",
+    "timeout_seconds": 60,
+    "max_retries": 2,
+    "min_confidence": 0,
+    "temperature": 0,
+    "request_interval": 6,
+    "use_cache": false,
+    "cache_path": "answer_books/ai_cache.json"
+  },
+  "tiku": {
+    "enabled": false,
+    "api_url": "https://api.gomooc.net/api.php",
+    "token": "",
+    "timeout_seconds": 15,
+    "max_retries": 1,
+    "request_interval": 2
+  }
+}

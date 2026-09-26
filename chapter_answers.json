@@ -1,0 +1,13 @@
+{
+  "1.1.2": "ABCBB",
+  "2.2.9": "CBABCABBCCC",
+  "2.3.2": "CCCBC",
+  "3.1.7": "BDDBBCCACB",
+  "3.2.2": "BDCBA",
+  "3.3.2": "BBBBB(ABCD)",
+  "4.1.2": "DDBB(ABCD)",
+  "4.2.7": "BBB(ABCD)(ABCD)",
+  "4.3.5": "CCCBC",
+  "4.4.2": "(ABCD)(AB)(BC)(ABCD)ABDBA",
+  "6.1.2": "B(ABCD)(ABCD)AAA"
+}

@@ -1,0 +1,47 @@
+# ===== Windows 系统文件 =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+build/
+dist/
+*.egg-info/
+
+# 虚拟环境（本地依赖，不提交）
+.venv/
+venv/
+env/
+
+# 浏览器登录会话（含课程账号状态，切勿上传）
+.course-browser/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.workbuddy/
+
+# 日志
+*.log
+logs/
+
+# 密钥与本地配置（AI/tiku token 等）
+.env
+.env.*
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# 用户录入的答案册（各自独立，不入库）
+answer_books/*.json
+answer_books/*.tmp
+answer_books/ai_cache.json
+
+# 压缩包
+*.zip

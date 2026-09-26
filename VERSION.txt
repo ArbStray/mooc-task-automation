@@ -1,0 +1,4 @@
+Course task automation package
+Package version: 2.5.0
+Release: vision-judge
+Prepared: 2026-09-26
