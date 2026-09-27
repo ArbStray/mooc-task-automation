@@ -13,6 +13,7 @@ put keys into source files or JSON configs.
 from __future__ import annotations
 
 import base64
+import ast
 import hashlib
 import json
 import os
@@ -66,6 +67,10 @@ VISION_SYSTEM_PROMPT = (
     "判断题用 A 表示对、B 表示错。"
     "confidence 是 0 到 1 的小数，表示你对答案正确的把握；无法确定时给低值。"
     "reason 用一句话说明为什么其他选项不对或该选项正确。"
+    "【格式硬性要求】JSON 必须完整闭合，不要中途截断；"
+    "题干或理由里出现的引号一律改用中文引号「」或『』，绝不要写英文双引号，"
+    "更不要不转义就使用 \\\" 之外的引号；"
+    "text 只填题干本身，不要包含题号、选项或你自己的分析。"
 )
 
 
@@ -173,38 +178,361 @@ def _default_post_json(url: str, headers: Mapping[str, str], payload: Mapping[st
         return response.read().decode("utf-8", errors="replace")
 
 
-def _parse_reply(content: str) -> Optional[tuple[str, float, str, str]]:
-    """Extract answer/confidence/reason/recognized-stem from model output."""
-    text = content.strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    if fence:
-        text = fence.group(1)
-    else:
-        braces = re.search(r"\{.*\}", text, re.S)
-        if braces:
-            text = braces.group(0)
-    try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return None
+_JSON_FENCE_RE = re.compile(r"```(?:json|JSON|javascript|js)?[ \t]*\r?\n?(.*?)(?:```|\Z)", re.S)
+_ANSWER_KEYS = ("answer", "answers", "correct_answer", "correctAnswer", "correct",
+                "choice", "choices", "selected", "selection", "答案", "正确答案")
+_CONFIDENCE_KEYS = ("confidence", "conf", "certainty", "score", "probability", "置信度", "把握")
+_REASON_KEYS = ("reason", "explanation", "why", "rationale", "analysis", "explain",
+                "justification", "分析", "理由", "解释")
+_STEM_KEYS = ("text", "question", "stem", "title", "content", "题干", "题目")
+_OPTIONS_KEYS = ("options", "option", "choices_map", "选项")
+
+
+def _first_key(data: Mapping[str, Any], names: tuple[str, ...]) -> Any:
+    """Case-insensitive lookup of the first matching key."""
     if not isinstance(data, Mapping):
         return None
-    answer = data.get("answer")
-    confidence = data.get("confidence", data.get("conf", 0))
-    if not isinstance(answer, str) or not answer.strip():
+    lowered = {str(key).strip().lower(): value for key, value in data.items()}
+    for name in names:
+        if name in data:
+            return data[name]
+        hit = lowered.get(name.lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def _to_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        parts = [_to_text(item) for item in value]
+        return "；".join(part for part in parts if part)
+    if isinstance(value, Mapping):
+        # {"A": "选项内容"} 之类的结构只取键名拼成字母串由调用方处理
+        return ""
+    return ""
+
+
+def _extract_json_objects(text: str) -> list[str]:
+    """Collect balanced {...} substrings, tolerant of braces inside strings.
+
+    Handles truncated output: if a candidate never closes, it is still
+    returned (with a best-effort closing brace) so the caller can try a
+    lenient parse instead of failing outright.
+    """
+    candidates: list[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(text[start:index + 1])
+                    start = -1
+    if depth > 0 and start >= 0:
+        # Truncated tail: try to salvage it by closing strings/braces.
+        tail = text[start:]
+        if in_string:
+            tail += '"'
+        tail += "}" * depth
+        candidates.append(tail)
+    return candidates
+
+
+def _unescape_stray_quotes(chunk: str) -> str:
+    """Escape quotes that appear inside a JSON string value.
+
+    Some models embed Chinese text containing `"` without escaping it, e.g.
+    {"text": "走出了"死亡谷"。"} — a strict parser sees the string end early
+    and rejects the whole object. We re-scan and escape such quotes, closing
+    each string only when the next non-space char looks like JSON structure.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    length = len(chunk)
+    while index < length:
+        char = chunk[index]
+        if escaped:
+            out.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            index += 1
+            continue
+        if char != '"':
+            out.append(char)
+            index += 1
+            continue
+        if not in_string:
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        # Inside a string: a quote is a real terminator only if what follows
+        # looks like `:` `,` `}` `]` — otherwise it is stray content.
+        probe = index + 1
+        while probe < length and chunk[probe] in " \t\r\n":
+            probe += 1
+        following = chunk[probe] if probe < length else ""
+        if following in ":,}]" or following == "":
+            in_string = False
+            out.append(char)
+        else:
+            out.append('\\"')
+        index += 1
+    if in_string:
+        out.append('"')
+    return "".join(out)
+
+
+def _scan_answers_by_key(chunk: str) -> Optional[dict[str, Any]]:
+    """Last-resort: regex out the fields we need from a broken object.
+
+    Used when no amount of quoting repair yields valid JSON (deeply truncated
+    replies, unescaped quotes, mixed quote styles).
+    """
+    if "{" not in chunk:
         return None
-    letters = "".join(dict.fromkeys(re.sub(r"[^A-Za-z]", "", answer).upper()))
+    data: dict[str, Any] = {}
+    for name in _ANSWER_KEYS:
+        match = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]{{1,40}})"', chunk, re.I)
+        if match:
+            data["answer"] = match.group(1).strip()
+            break
+    if not data.get("answer"):
+        match = re.search(r'"answer"\s*:\s*([^\s,}"\']{1,20})', chunk, re.I)
+        if match:
+            data["answer"] = match.group(1).strip()
+    if not data.get("answer"):
+        return None
+    for name in ("confidence", "conf"):
+        match = re.search(rf'"{name}"\s*:\s*"?([0-9.]+%?)', chunk)
+        if match:
+            data["confidence"] = match.group(1)
+            break
+    for name in ("reason", "explanation", "why"):
+        match = re.search(rf'"{name}"\s*:\s*"(.*?)(?<!\\)"', chunk, re.S)
+        if match:
+            data["reason"] = match.group(1)
+            break
+    for name in ("text", "question", "stem"):
+        match = re.search(rf'"{name}"\s*:\s*"(.*?)(?<!\\)"', chunk, re.S)
+        if match:
+            data["stem"] = match.group(1)
+            break
+    return data
+
+
+def _loads_lenient(chunk: str) -> Optional[Any]:
+    """json.loads with small repairs for common model formatting slips."""
+    # 0) 先试 ast.literal_eval：对单引号/尾随逗号的容忍度远高于 json。
+    try:
+        evaluated = ast.literal_eval(chunk)
+        if isinstance(evaluated, (dict, list)):
+            return evaluated
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        pass
+
+    # 1) 原样 / 归一换行。
+    for attempt in (chunk, chunk.replace("\r\n", "\n")):
+        try:
+            return json.loads(attempt)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 2) 转义字符串值里未转义的引号（中文引号最常见，注意要在常规修复之前做，
+    #    否则键名引号化会把裸键名也误识别成"字符串内的引号"）。
+    variants: list[str] = []
+    requoted = _unescape_stray_quotes(chunk)
+    if requoted != chunk:
+        variants.append(requoted)
+
+    # 3) 常规修复组合。
+    repaired = re.sub(r",\s*([}\]])", r"\1", chunk)              # 尾随逗号
+    if '"' not in repaired:
+        repaired = repaired.replace("'", '"')                    # 纯单引号
+    repaired = re.sub(r"([{,]\s*)([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff]*)(\s*:)",
+                      r'\1"\2"\3', repaired)                      # 无引号键名
+    repaired = re.sub(r":\s*([A-Za-z])\s*([,}])", r': "\1"\2', repaired)  # 裸字母值
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    variants.append(repaired)
+    variants.append(_unescape_stray_quotes(repaired))
+
+    for candidate in variants:
+        if not candidate:
+            continue
+        for text in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return None
+
+
+def _parse_plain_text(text: str) -> Optional[dict[str, Any]]:
+    """Fallback for non-JSON replies: 答案：B / answer is B / **B**."""
+    data: dict[str, Any] = {}
+    answer_match = re.search(
+        r"(?:答案|answer|correct(?:\s+answer)?|选择|choice)\s*[:：为是]?\s*\**\s*([A-Ha-h](?:\s*[,，、/和\s]*[A-Ha-h])*)",
+        text, re.I)
+    if not answer_match:
+        answer_match = re.search(r"\*\*([A-H])\*\*", text)
+    if answer_match:
+        data["answer"] = answer_match.group(1)
+    confidence_match = re.search(r"(?:confidence|置信度|把握)\D{0,6}(\d+(?:\.\d+)?)\s*%?", text, re.I)
+    if confidence_match:
+        value = float(confidence_match.group(1))
+        data["confidence"] = value / 100 if value > 1 else value
+    reason_match = re.search(r"(?:reason|理由|解释|分析)\s*[:：]\s*(.+)", text)
+    if reason_match:
+        data["reason"] = reason_match.group(1).strip()
+    return data or None
+
+
+def _find_answer_object(data: Any, depth: int = 0) -> Optional[Mapping[str, Any]]:
+    """Locate the object that actually carries an answer field.
+
+    Handles replies like {"result": {"answer": "A"}, "status": "ok"} — without
+    this we would treat the outer object's keys as option letters.
+    """
+    if depth > 3:
+        return None
+    if isinstance(data, Mapping):
+        if _first_key(data, _ANSWER_KEYS) is not None:
+            return data
+        for value in data.values():
+            found = _find_answer_object(value, depth + 1)
+            if found is not None:
+                return found
+        return None
+    if isinstance(data, (list, tuple)):
+        for item in data:
+            found = _find_answer_object(item, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def parse_reply_best_effort(content: str) -> Optional[dict[str, Any]]:
+    """Best-effort extraction of a model reply, returning a raw dict.
+
+    Handles: ```json fences, leading/trailing prose, multiple JSON objects,
+    truncated JSON, trailing commas, unquoted keys, bare-letter values,
+    full-width punctuation and non-JSON plain answers.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return None
+    text = content.strip()
+
+    # 1) 优先取代码块内容（可能没有闭合的 ```）。
+    chunks: list[str] = []
+    for match in _JSON_FENCE_RE.finditer(text):
+        body = match.group(1).strip()
+        if body:
+            chunks.append(body)
+    chunks.extend(_extract_json_objects(text))
+    # 整段直接尝试一次，应对 {"a":1} 之外的数组/对象顶层结构。
+    chunks.append(text)
+
+    seen: set[str] = set()
+    fallback_scan: Optional[dict[str, Any]] = None
+    for chunk in chunks:
+        for candidate in _extract_json_objects(chunk) + [chunk]:
+            candidate = candidate.strip().strip("`").strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            data = _loads_lenient(candidate)
+            found = _find_answer_object(data)
+            if found is not None:
+                return dict(found)
+            # JSON 修不好时，用正则从坏对象里抠出关键字段，留作最后兜底。
+            if fallback_scan is None:
+                fallback_scan = _scan_answers_by_key(candidate)
+
+    if fallback_scan is not None:
+        return fallback_scan
+
+    plain = _parse_plain_text(text)
+    if plain is not None:
+        return plain
+
+    # 最后兜底：整段里只有孤立的一个大写选项字母。
+    stripped = re.sub(r"```.*?```", "", text, flags=re.S).strip()
+    lone = re.fullmatch(r"[^A-Za-z]{0,8}([A-Ha-h])[^A-Za-z]{0,8}", stripped)
+    if lone:
+        return {"answer": lone.group(1), "confidence": 0, "reason": ""}
+    return None
+
+
+def _normalize_confidence(value: Any) -> float:
+    """Accept 0.85 / 85 / "85%" / "0.85" and clamp to [0, 1]."""
+    if isinstance(value, bool):
+        return 0.0
+    percent = False
+    if isinstance(value, str):
+        match = re.search(r"(\d+(?:\.\d+)?)", value)
+        if not match:
+            return 0.0
+        percent = "%" in value
+        value = float(match.group(1))
+    if not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    if percent or value > 1.0:
+        value = value / 100.0
+    return max(0.0, min(1.0, value))
+
+
+def _parse_reply(content: str) -> Optional[tuple[str, float, str, str]]:
+    """Extract answer/confidence/reason/recognized-stem from model output."""
+    data = parse_reply_best_effort(content)
+    if data is None:
+        return None
+    answer = _first_key(data, _ANSWER_KEYS)
+    letter_source = _to_text(answer)
+    if not letter_source and isinstance(answer, Mapping):
+        letter_source = "".join(str(key) for key in answer)
+    if not letter_source and isinstance(answer, list):
+        letter_source = "".join(
+            item if isinstance(item, str) else str(_first_key(item, ("letter", "key", "option", "value")) or "")
+            for item in answer)
+    letters = "".join(dict.fromkeys(re.sub(r"[^A-Za-z]", "", letter_source).upper()))
     if not letters:
         return None
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-        confidence = 0
-    reason = data.get("reason", data.get("explanation", data.get("why", "")))
-    if not isinstance(reason, str):
-        reason = ""
-    stem = data.get("text", data.get("question", data.get("stem", "")))
-    if not isinstance(stem, str):
-        stem = ""
-    return letters, max(0.0, min(1.0, float(confidence))), reason.strip(), stem.strip()
+    confidence = _normalize_confidence(_first_key(data, _CONFIDENCE_KEYS))
+    reason = _to_text(_first_key(data, _REASON_KEYS))
+    stem = _to_text(_first_key(data, _STEM_KEYS))
+    if stem and len(stem) > 400:
+        stem = stem[:400] + "..."
+    if reason and len(reason) > 200:
+        reason = reason[:200] + "..."
+    return letters, confidence, reason, stem
 
 
 class AIAnswerProvider:
@@ -329,7 +657,11 @@ class AIAnswerProvider:
                 if parsed is not None:
                     self._model_fails[model] = 0
                     return parsed
-                error = f"回复无法解析: {content!r:.120}" if isinstance(content, str) else "回复格式异常"
+                if isinstance(content, str):
+                    preview = " ".join(content.split())[:160]
+                    error = f"回复无法解析（原始内容：{preview!r}）"
+                else:
+                    error = "回复格式异常（content 不是文本）"
             except urllib.error.HTTPError as exc:
                 try:
                     detail = exc.read().decode("utf-8", errors="replace")[:200]
